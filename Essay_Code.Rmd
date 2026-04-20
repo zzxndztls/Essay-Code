@@ -1,0 +1,598 @@
+---
+title: "Emotive Rhetoric in the House of Commons Before and After the Brexit Referendum: A Dictionary-Based Analysis of Parliamentary Debate"
+author: "Zhitong Chen"
+date: "2026-04-20"
+output: word_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# load all required packages
+library(tidyverse)          # core data wrangling and ggplot2 visualisation
+library(data.table)         # fast reading of large csv files
+library(tidytext)           # tidy text mining framework (Silge and Robinson 2017)
+library(quanteda)           # quantitative text analysis infrastructure
+library(quanteda.textstats) # readability scores and text-level statistics
+library(scales)             # improved axis label formatting for ggplot2
+library(textdata)           # provides access to sentiment lexicons (e.g. Bing)
+
+# set a temporary directory for package downloads (specific to my laptop)
+Sys.setenv(TMPDIR = "C:/Temp")
+dir.create("C:/Temp", showWarnings = FALSE)
+```
+
+```{r load-data, cache=FALSE}
+# read UK parliamentary speech data from Osnabrugge et al. (2021)
+# source:  Harvard Dataverse (doi: 10.7910/DVN/QDTLYV)
+# fread() from data.table is used for speed on this large csv file
+data <- fread("uk_data.csv", encoding = "UTF-8")
+
+# convert the date column from character to Date class
+# required for all subsequent time-based filtering and grouping
+data$date <- as.Date(data$date)
+```
+
+```{r inspect-data}
+# verify successful data loading with basic summary statistics
+cat("Total speeches:", nrow(data), "\n")
+cat("Variables:", ncol(data), "\n")
+
+# confirm the temporal coverage of the datase
+cat("Date range:", as.character(min(data$date, na.rm = TRUE)), "to", 
+    as.character(max(data$date, na.rm = TRUE)), "\n")
+```
+
+```{r define-period}
+# define the Brexit referendum date as the analytical cutpoint
+brexit_date <- as.Date("2016-06-23") # referendum took place on 23 June 2016
+
+# create a binary indicator for the post-referendum period
+# post_brexit = 1 for speeches on or after referendum day, 0 otherwise
+# period is a labelled version of the same variable for use in plots
+data <- data %>%
+  mutate(
+    post_brexit = ifelse(date >= brexit_date, 1, 0),         # binary indicator
+    period = ifelse(date >= brexit_date, "Post-Referendum",    "Pre-Referendum")                                          # labelled factor
+  )
+# verify the split between pre- and post-referendum speeches
+cat("Full data pre-referendum:", sum(data$post_brexit == 0), "\n")
+cat("Full data post-referendum:", sum(data$post_brexit == 1), "\n")
+```
+
+```{r stratified-sample}
+# draw a stratified random sample balanced across four cells:
+# government x post_brexit (2 x 2 = 4 groups, 12500 speeches each)
+# the seed is fixed at 12345 so the sample is fully reproducible
+set.seed(12345)
+
+data_samp <- data %>%                   
+  group_by(government, post_brexit) %>% # stratify by the two key variables
+  slice_sample(n = 12500) %>%           # draw 12500 random rows per cell
+  ungroup()                             # remove grouping for later operations
+
+# confirm sample size and verify equal cell sizes
+cat("Sample size:", nrow(data_samp), "\n")
+table(data_samp$government, data_samp$post_brexit)
+```
+
+```{r create-variables}
+# create time-related variables on the sampled data for trend analysis
+data_samp$year <- as.numeric(format(data_samp$date, "%Y"))   # calendar year
+data_samp$month <- as.numeric(format(data_samp$date, "%m"))  # month number
+data_samp$year_month <- format(data_samp$date, "%Y-%m")      # year-month label
+
+# create labelled categorical variables for plotting and tables
+data_samp <- data_samp %>%
+  mutate(
+    period = ifelse(date >= brexit_date,                    # period label
+                    "Post-Referendum", "Pre-Referendum"),
+    side = ifelse(government == 1, "Government", "Opposition") # side label
+  )
+```
+
+```{r debate-type}
+# classify each speech into a debate type category
+# used as a control variable in Model 3 to test H3
+# case_when assigns the most specific category first
+# speeches not matching any special type default to "Regular Debate"
+data_samp <- data_samp %>%
+  mutate(debate_type = case_when(
+    pm_questions == 1 ~ "PMQs",                         # Prime Minister's Questions
+    m_questions == 1 ~ "Other Question Time",           # other ministerial questions
+    u_questions == 1 ~ "Urgent Questions",              # urgent questions
+    queen_debate_day1 == 1 ~ "Queen's Speech Opening",  # Queen's Speech day 1
+    queen_debate_others == 1 ~ "Queen's Speech Other",  # Queen's Speech other days
+    TRUE ~ "Regular Debate"                             # all remaining speeches
+  ))
+```
+
+```{r load-dictionaries}
+# load the domain-specific dictionaries from Osnabrugge et al. (2021)
+# emotive_uk.csv: 2015 words classified as emotive in parliamentary speech
+# neutral_uk.csv: 2095 words classified as neutral in parliamentary speech
+emotive_words <- read.csv("emotive_uk.csv", stringsAsFactors = FALSE)
+neutral_words <- read.csv("neutral_uk.csv", stringsAsFactors = FALSE)
+
+# trim whitespace from word columns to prevent silent matching failures
+emotive_words$word <- trimws(emotive_words$word)
+neutral_words$word <- trimws(neutral_words$word)
+
+# confirm the size of each dictionary
+cat("Emotive dictionary size:", nrow(emotive_words), "words\n")
+cat("Neutral dictionary size:", nrow(neutral_words), "words\n")
+```
+
+```{r tokenize}
+# tokenise all speech texts into one-word-per-row (tidy text) format
+# unnest_tokens converts to lowercase automatically; stemming is not applied
+# stop words are retained because they may overlap with dictionary entries
+tidy_speeches <- data_samp %>%
+  select(id_speech, text, government, date, year, year_month,
+         post_brexit, period, side, debate_type) %>% # keep only needed columns
+  unnest_tokens(word, text)                          # one token per row individual words
+
+# count total words in each speech for use as the denominato
+words_per_speech <- tidy_speeches %>%  
+  group_by(id_speech) %>%       # group by speech identifier
+  summarise(total_words = n())  # count tokens per speech
+
+# summary statistics on token counts
+cat("Total tokens:", nrow(tidy_speeches), "\n")
+cat("Mean words per speech:", round(mean(words_per_speech$total_words), 1), "\n")
+```
+
+```{r compute-score}
+# count emotive dictionary words per speech via inner_join
+# inner_join keeps only tokens found in the emotive word list 
+emotive_counts <- tidy_speeches %>%
+  inner_join(emotive_words, by = "word") %>%  # match tokens to emotive list
+  group_by(id_speech) %>%                     # group by speech
+  summarise(n_emotive = n())                  # count matched emotive tokens
+
+# count neutral dictionary words per speech using the same logic
+neutral_counts <- tidy_speeches %>%           
+  inner_join(neutral_words, by = "word") %>%  # match tokens to neutral list
+  group_by(id_speech) %>%                     # group by speech
+  summarise(n_neutral = n())                  # count matched neutral words
+
+# combine counts with total words and compute the emotive rhetoric score
+# score = (pct emotive) - (pct neutral), following Osnabrugge et al. (2021)
+speech_scores <- words_per_speech %>%
+  left_join(emotive_counts, by = "id_speech") %>%   # add emotive counts
+  left_join(neutral_counts, by = "id_speech") %>%   # add neutral counts
+  mutate(
+    n_emotive = replace_na(n_emotive, 0),           # zero if no emotive matches
+    n_neutral = replace_na(n_neutral, 0),           # zero if no neutral matches
+    pct_emotive = (n_emotive / total_words) * 100,  # emotive words as pct of total
+    pct_neutral = (n_neutral / total_words) * 100,  # neutral words as pct of total
+    own_score = pct_emotive - pct_neutral           # emotive rhetoric score
+  )
+
+# merge scores into main dataframe
+data_samp <- data_samp %>%
+  left_join(speech_scores %>% select(id_speech, own_score, 
+                                      pct_emotive, pct_neutral,
+                                      total_words),
+            by = "id_speech")
+
+# summary statistics for the computed emotive rhetoric score
+summary(data_samp$own_score)
+```
+
+```{r validate-score}
+# validate computed score against the authors' pre-calculated variable
+# high correlation confirms our implementation replicates theirs
+cor_val <- cor(data_samp$own_score, data_samp$emotive_rhetoric,
+               use = "complete.obs")
+cat("Correlation with original authors' score:", round(cor_val, 4), "\n")
+```
+
+
+```{r fig1-yearly-trend, fig.width=8, fig.height=5}
+# Figure 1: yearly trend in emotive rhetoric score with referendum marker
+# shows the mean own_score by calendar year with 95% confidence intervals
+
+# compute yearly mean and standard error
+yearly_trend <- data_samp %>%
+  group_by(year) %>%                               # group speeches by year
+  summarise(
+    mean_score = mean(own_score, na.rm = TRUE),    # mean score per year
+    se = sd(own_score, na.rm = TRUE) / sqrt(n()),  # standard error of the mean
+    .groups = "drop"
+  )
+
+# plot the yearly trend as a line with confidence ribbon
+ggplot(yearly_trend, aes(x = year, y = mean_score)) +
+  geom_line(colour = "steelblue", linewidth = 0.8) +        # trend line
+  geom_point(colour = "steelblue", size = 2) +              # annual data points
+  geom_ribbon(aes(ymin = mean_score - 1.96 * se,            # lower 95% CI
+                  ymax = mean_score + 1.96 * se),           # upper 95% CI
+              alpha = 0.2, fill = "steelblue") +
+  geom_vline(xintercept = 2016.5, linetype = "dashed",      # vertical referendum line
+             colour = "red") +
+  annotate("text", x = 2016.7, y = max(yearly_trend$mean_score),
+           label = "Referendum", hjust = 0, colour = "red",  # label for referendum
+           size = 3.5) +
+  labs(x = "Year", y = "Mean Emotive Rhetoric Score") +
+  scale_x_continuous(breaks = seq(2002, 2019, by = 2)) +     # x-axis tick marks
+  theme_minimal()
+```
+
+```{r pre-post-test}
+# formal comparison of emotive rhetoric before and after the referendum
+# compute group means, standard deviations and 95% confidence intervals
+period_comparison <- data_samp %>%
+  group_by(period) %>%
+  summarise(
+    mean_score = mean(own_score, na.rm = TRUE),  # group mean
+    sd_score = sd(own_score, na.rm = TRUE),      # standard deviation
+    n = n(),                                     # group size
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se = sd_score / sqrt(n),                    # standard error
+    ci_lower = mean_score - 1.96 * se,          # lower 95% CI
+    ci_upper = mean_score + 1.96 * se           # upper 95% CI
+  )
+
+period_comparison
+
+# two-sample t-test comparing pre- and post-referendum scores
+t_result <- t.test(own_score ~ post_brexit, data = data_samp)
+cat("t-statistic:", round(t_result$statistic, 3), "\n")
+cat("p-value:", format.pval(t_result$p.value, digits = 3), "\n")
+
+# Cohen's d as a standardised measure of effect size
+# difference in means divided by the pooled standard deviation
+pooled_sd <- sqrt(
+  (period_comparison$sd_score[1]^2 + period_comparison$sd_score[2]^2) / 2
+)
+cohens_d <- abs(diff(period_comparison$mean_score)) / pooled_sd
+cat("Cohen's d:", round(cohens_d, 4), "\n")
+```
+
+```{r fig2-pre-post-by-side, fig.width=7, fig.height=5}
+# Figure 2: grouped bar chart comparing pre/post scores by government vs opposition
+# tests H2 visually by showing whether the increase differs by side of the House
+
+# compute group means and confidence intervals by period and side
+period_by_side <- data_samp %>%
+  group_by(period, side) %>%
+  summarise(
+    mean_score = mean(own_score, na.rm = TRUE),   # group mean
+    sd_score = sd(own_score, na.rm = TRUE),       # group standard deviation
+    n = n(),                                      # group size
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se = sd_score / sqrt(n),                       # standard error
+    ci_lower = mean_score - 1.96 * se,             # lower CI bound
+    ci_upper = mean_score + 1.96 * se              # upper CI bound
+  )
+
+period_by_side
+
+# create grouped bar chart
+ggplot(period_by_side,
+       aes(x = period, y = mean_score, fill = side)) +
+  geom_bar(stat = "identity",
+           position = position_dodge(width = 0.7), width = 0.6) +  # side-by-side bars
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),              # error bars
+                position = position_dodge(width = 0.7), width = 0.15) +
+  labs(x = "", y = "Mean Emotive Rhetoric Score", fill = "") +
+  scale_fill_manual(values = c("Government" = "steelblue",          # colour scheme
+                                "Opposition" = "indianred")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r regression-models}
+# three nested OLS regression models testing H1, H2 and H3
+# Model 1: post_brexit only (tests H1)
+model1 <- lm(own_score ~ post_brexit, data = data_samp)
+
+# Model 2: adds government and its interaction with post_brexit (tests H2)
+# a significant interaction would indicate asymmetric effects
+model2 <- lm(own_score ~ post_brexit * government, data = data_samp)
+
+# Model 3: adds debate type dummies as controls (tests H3)
+# significant post_brexit here means the effect is not an artefact of debate mix
+model3 <- lm(own_score ~ post_brexit * government + debate_type, 
+             data = data_samp)
+
+# print full summary for each model
+cat("=== Model 1: Brexit effect only ===\n")
+summary(model1)
+
+cat("\n=== Model 2: Brexit x Government interaction ===\n")
+summary(model2)
+
+cat("\n=== Model 3: With debate type controls ===\n")
+summary(model3)
+```
+
+```{r fig3-yearly-by-side, fig.width=8, fig.height=5}
+# Figure 3: yearly trend split by government vs opposition
+# this visualises whether the two sides diverge after the referendum
+
+# compute yearly means separately for government and opposition
+yearly_by_side <- data_samp %>%
+  group_by(year, side) %>%
+  summarise(
+    mean_score = mean(own_score, na.rm = TRUE),    # mean per year per side
+    se = sd(own_score, na.rm = TRUE) / sqrt(n()),  # standard error
+    .groups = "drop"
+  )
+
+# plot two trend lines with referendum marker
+ggplot(yearly_by_side, aes(x = year, y = mean_score, colour = side)) +
+  geom_line(linewidth = 0.8) +   # trend lines
+  geom_point(size = 1.5) +        # data points
+  geom_vline(xintercept = 2016.5, linetype = "dashed", colour = "grey40") +
+  annotate("text", x = 2016.7, y = max(yearly_by_side$mean_score),
+           label = "Referendum", hjust = 0, colour = "grey40", size = 3.5) +
+  labs(x = "Year", y = "Mean Emotive Rhetoric Score", colour = "") +
+  scale_colour_manual(values = c("Government" = "steelblue",
+                                  "Opposition" = "indianred")) +
+  scale_x_continuous(breaks = seq(2002, 2019, by = 2)) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r fig4-quarterly, fig.width=9, fig.height=5}
+# Figure 4: quarterly trend zoomed in on the 2014-2019 period
+# provides a closer view of the trajectory around the referendum date
+
+# compute quarterly means for speeches from 2014 onward
+quarterly <- data_samp %>%
+  filter(year >= 2014) %>%                                      # restrict to 2014+
+  mutate(quarter = paste0(year, "-Q", ceiling(month / 3))) %>%     # create quarter label
+  group_by(quarter) %>%
+  summarise(
+    mean_score = mean(own_score, na.rm = TRUE),                   # quarterly mean
+    se = sd(own_score, na.rm = TRUE) / sqrt(n()),                 # standard error
+    mid_date = median(date),                                      # midpoint date for x-axis
+    .groups = "drop"
+  )
+
+# plot quarterly trend with referendum marker and confidence ribbon
+ggplot(quarterly, aes(x = mid_date, y = mean_score)) +
+  geom_line(colour = "steelblue", linewidth = 0.8) +
+  geom_point(colour = "steelblue", size = 2) +
+  geom_ribbon(aes(ymin = mean_score - 1.96 * se,
+                  ymax = mean_score + 1.96 * se),
+              alpha = 0.2, fill = "steelblue") +
+  geom_vline(xintercept = brexit_date,              # vertical referendum line
+             linetype = "dashed", colour = "red") +
+  annotate("text", x = brexit_date + 30,
+           y = max(quarterly$mean_score),
+           label = "23 June 2016", hjust = 0, colour = "red", size = 3.5) +
+  labs(x = "", y = "Mean Emotive Rhetoric Score") +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "6 months") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r word-shift}
+# analyse which emotive dictionary words shifted most after the referendum
+# this helps interpret the substantive nature of the aggregate change
+
+# count total tokens in each period for computing rates
+total_pre <- tidy_speeches %>% filter(post_brexit == 0) %>% nrow()   # total pre-ref tokens
+total_post <- tidy_speeches %>% filter(post_brexit == 1) %>% nrow()  # total post-ref tokens
+
+# compute per-10,000-word rate for each emotive word in the pre-referendum period
+emotive_pre <- tidy_speeches %>%
+  filter(post_brexit == 0) %>%                     # select pre-referendum tokens
+  inner_join(emotive_words, by = "word") %>%       # match against emotive dictionary
+  count(word, sort = TRUE) %>%                     # count occurrences of each word
+  mutate(rate_pre = (n / total_pre) * 10000) %>%   # normalise to rate per 10,000
+  select(word, rate_pre)
+
+# same computation for the post-referendum period
+emotive_post <- tidy_speeches %>%
+  filter(post_brexit == 1) %>%                       # select post-referendum tokens
+  inner_join(emotive_words, by = "word") %>%         # match against emotive dictionary
+  count(word, sort = TRUE) %>%                       # count occurrences
+  mutate(rate_post = (n / total_post) * 10000) %>%   # normalise to rate per 10,000
+  select(word, rate_post)
+
+# join pre and post rates and compute the change for each word
+word_shift <- emotive_pre %>%
+  inner_join(emotive_post, by = "word") %>%    # merge pre and post rates
+  mutate(change = rate_post - rate_pre) %>%    # difference in rates
+  arrange(desc(change))                        # sort by largest increase
+
+cat("Top 15 emotive words that increased most after the referendum:\n")
+head(word_shift, 15)
+
+cat("\nTop 15 emotive words that decreased most after the referendum:\n")
+tail(word_shift, 15)
+```
+
+```{r fig5-word-shift, fig.width=7, fig.height=6}
+# Figure 5: bar chart of the top 10 words that increased and decreased most
+
+# select the top 10 increases and top 10 decreases
+top_increase <- word_shift %>% head(10) %>% mutate(direction = "Increased")
+top_decrease <- word_shift %>% tail(10) %>% mutate(direction = "Decreased")
+shift_plot_data <- bind_rows(top_increase, top_decrease)   # combine for plotting
+
+# horizontal bar chart ordered by change magnitude
+ggplot(shift_plot_data, aes(x = reorder(word, change), y = change,
+                             fill = direction)) +
+  geom_bar(stat = "identity", width = 0.7) +     # bars
+  coord_flip() +                                  # horizontal layout
+  labs(x = "", y = "Change in Rate (per 10,000 words)", fill = "") +
+  scale_fill_manual(values = c("Increased" = "indianred",
+                                "Decreased" = "steelblue")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+```{r readability-analysis}
+# SUPPLEMENTARY ANALYSIS: linguistic complexity (Week 4 method)
+# compute Flesch-Kincaid readability score for each speech
+# higher scores  indicate easier (less complex) language
+# this complements the emotive rhetoric measure by examining
+# whether the post-referendum period also saw a change in complexity
+
+# create a quanteda corpus object from the sampled speeches
+corp_samp <- corpus(data_samp, text_field = "text")
+
+# compute Flesch-Kincaid grade level for each speech
+# textstat_readability is from the quanteda.textstats package (Week 4)
+readability_scores <- textstat_readability(corp_samp, 
+                                            measure = "Flesch.Kincaid")
+
+# attach readability scores back to the main dataframe
+data_samp$readability <- readability_scores$Flesch.Kincaid
+
+# compare mean readability before and after the referendum
+readability_comparison <- data_samp %>%
+  group_by(period) %>%
+  summarise(
+    mean_readability = mean(readability, na.rm = TRUE),  # mean complexity score
+    sd_readability = sd(readability, na.rm = TRUE),      # standard deviation
+    n = n(),                                              # group size
+    .groups = "drop"
+  )
+
+cat("Readability (Flesch-Kincaid) by period:\n")
+readability_comparison
+
+# t-test for readability difference
+t_read <- t.test(readability ~ post_brexit, data = data_samp)
+cat("Readability t-statistic:", round(t_read$statistic, 3), "\n")
+cat("Readability p-value:", format.pval(t_read$p.value, digits = 3), "\n")
+```
+
+```{r robustness-original}
+# Robustness Check 1: replicate using the authors' pre-computed score
+# this verifies that our findings do not depend on our tokenisation
+original_comparison <- data_samp %>%
+  group_by(period) %>%
+  summarise(
+    own_dict = mean(own_score, na.rm = TRUE),          # our computed score
+    original = mean(emotive_rhetoric, na.rm = TRUE),   # authors' pre-computed score 
+    .groups = "drop"
+  )
+
+cat("Comparison of our score vs original authors' score:\n")
+original_comparison
+```
+
+```{r robustness-bing}
+# Robustness Check 2: compare with the Bing general-purpose sentiment lexicon
+# Bing measures positive/negative sentiment, a different construct from
+# domain-specific emotive rhetoric; this tests sensitivity to dictionary choice
+
+# count positive and negative Bing words per speech
+
+bing_scores <- tidy_speeches %>%
+  inner_join(get_sentiments("bing"), by = "word",
+             relationship = "many-to-many") %>%  # match tokens against Bing
+  count(id_speech, sentiment) %>%                # count pos and neg per speech
+  pivot_wider(names_from = sentiment,            # reshape to one row per speech
+              values_from = n, values_fill = 0) %>%
+  left_join(words_per_speech, by = "id_speech") %>%   # add total word count
+  mutate(bing_net = ((positive - negative) /
+                       total_words) * 100)
+
+# merge Bing scores into the main dataframe
+data_samp <- data_samp %>%
+  left_join(bing_scores %>% select(id_speech, bing_net), by = "id_speech")
+
+# compare Bing sentiment by period
+bing_comparison <- data_samp %>%
+  group_by(period) %>%
+  summarise(
+    bing_sentiment = mean(bing_net, na.rm = TRUE),  # mean Bing score per period
+    .groups = "drop"
+  )
+
+cat("Bing sentiment by period:\n")
+bing_comparison
+```
+
+```{r robustness-correlation}
+# Robustness Check 3: correlation between the three sentiment measures
+# low correlation between domain-specific and general-purpose measures
+# confirms they capture different aspects of language
+cor_table <- data_samp %>%
+  select(own_score, emotive_rhetoric, bing_net) %>%  # select the three scores
+  drop_na() %>%                                     # remove missing values
+  cor()                                             # compute correlation matrix
+
+cat("Correlation matrix:\n")
+round(cor_table, 3)
+```
+
+```{r robustness-exclude-short}
+# Robustness Check 4: exclude very short speeches (fewer than 20 words)
+# short speeches may produce extreme percentage scores due to small denominators
+data_long <- data_samp %>% filter(total_words >= 20)  # keep only speeches >= 20 words
+
+# compare means on the restricted sample
+long_comparison <- data_long %>%
+  group_by(period) %>%
+  summarise(
+    mean_score = mean(own_score, na.rm = TRUE),         # mean score per period
+    n = n(),                                             # sample size per period
+    .groups = "drop"
+  )
+
+cat("Results excluding speeches shorter than 20 words:\n")
+long_comparison
+```
+
+```{r}
+# Robustness Check 5: remove formulaic words from the emotive dictionary
+# "thank" and "house" are the two largest movers on the increase list
+# but both function as parliamentary conventions in most contexts
+# this test checks whether the main finding survives their exclusion
+
+# create a filtered emotive dictionary without these two words
+emotive_filtered <- emotive_words %>%
+  filter(!word %in% c("thank", "house"))                  # drop two formulaic items
+cat("Filtered dictionary size:", nrow(emotive_filtered), "words\n")
+
+# recount emotive words per speech using the filtered dictionary
+emotive_counts_filtered <- tidy_speeches %>%
+  inner_join(emotive_filtered, by = "word") %>%            # match against filtered list
+  group_by(id_speech) %>%                                  # group by speech
+  summarise(n_emotive_filt = n())                          # count filtered matches
+
+# recompute the emotive rhetoric score with the filtered dictionary
+score_filtered <- words_per_speech %>%
+  left_join(emotive_counts_filtered, by = "id_speech") %>% # add filtered emotive counts
+  left_join(neutral_counts, by = "id_speech") %>%          # add neutral counts as before
+  mutate(
+    n_emotive_filt = replace_na(n_emotive_filt, 0),        # zero if no matches
+    n_neutral = replace_na(n_neutral, 0),                  # zero if no matches
+    score_filtered = (n_emotive_filt / total_words) * 100  # filtered emotive pct
+                     - (n_neutral / total_words) * 100     # minus neutral pct
+  )
+
+# merge the filtered score into the main dataframe
+data_samp <- data_samp %>%
+  left_join(score_filtered %>%
+              select(id_speech, score_filtered),
+            by = "id_speech")
+
+# compare original and filtered scores by period
+filter_comparison <- data_samp %>%
+  group_by(period) %>%
+  summarise(
+    original_score = mean(own_score, na.rm = TRUE),        # original dictionary score
+    filtered_score = mean(score_filtered, na.rm = TRUE),   # score without thank/house
+    .groups = "drop"
+  )
+
+cat("Original vs filtered dictionary scores by period:\n")
+filter_comparison
+
+# t-test on filtered score
+t_filtered <- t.test(score_filtered ~ post_brexit, data = data_samp)
+cat("Filtered score t-statistic:", round(t_filtered$statistic, 3), "\n")
+cat("Filtered score p-value:", format.pval(t_filtered$p.value, digits = 3), "\n")
+```
+
