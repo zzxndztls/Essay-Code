@@ -22,7 +22,6 @@ dir.create("C:/Temp", showWarnings = FALSE)
 
 ```{r load-data, cache=FALSE}
 # read UK parliamentary speech data from Osnabrugge et al. (2021)
-# source:  Harvard Dataverse (doi: 10.7910/DVN/QDTLYV)
 # fread() from data.table is used for speed on this large csv file
 data <- fread("uk_data.csv", encoding = "UTF-8")
 
@@ -429,7 +428,7 @@ ggplot(shift_plot_data, aes(x = reorder(word, change), y = change,
   theme(legend.position = "bottom")
 ```
 ```{r readability-analysis}
-# SUPPLEMENTARY ANALYSIS: linguistic complexity (Week 4 method)
+# Supplementary Analysis: linguistic complexity
 # compute Flesch-Kincaid readability score for each speech
 # higher scores  indicate easier (less complex) language
 # this complements the emotive rhetoric measure by examining
@@ -439,7 +438,7 @@ ggplot(shift_plot_data, aes(x = reorder(word, change), y = change,
 corp_samp <- corpus(data_samp, text_field = "text")
 
 # compute Flesch-Kincaid grade level for each speech
-# textstat_readability is from the quanteda.textstats package (Week 4)
+# textstat_readability is from the quanteda.textstats package 
 readability_scores <- textstat_readability(corp_samp, 
                                             measure = "Flesch.Kincaid")
 
@@ -471,7 +470,7 @@ cat("Readability p-value:", format.pval(t_read$p.value, digits = 3), "\n")
 original_comparison <- data_samp %>%
   group_by(period) %>%
   summarise(
-    own_dict = mean(own_score, na.rm = TRUE),          # our computed score
+    own_dict = mean(own_score, na.rm = TRUE),          # my computed score
     original = mean(emotive_rhetoric, na.rm = TRUE),   # authors' pre-computed score 
     .groups = "drop"
   )
